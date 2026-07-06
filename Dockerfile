@@ -45,6 +45,26 @@ RUN cd /ComfyUI/custom_nodes && \
     cd ComfyUI-WanVideoWrapper && \
     pip install -r requirements.txt
 
+# =============================================================================
+# ADICIONAR ISTO NO Dockerfile DO FORK (RIFE — interpolacao de frames).
+# Coloque logo APOS o bloco que clona o ComfyUI-WanVideoWrapper e ANTES da linha
+# `COPY . .`, pra ficar junto dos outros custom_nodes.
+#
+# O repo original NAO traz o Frame-Interpolation (RIFE) — ele e' adicao nossa.
+# Mesma abordagem do nosso worker atual: requirements-no-cupy (evita quebrar o
+# build por causa do cupy) + baixa o modelo rife47.pth e aponta o ckpts_path.
+# Nao-fatal: se falhar, o build segue e so o toggle RIFE fica indisponivel.
+# =============================================================================
+RUN set +e; cd /ComfyUI/custom_nodes; \
+    ( git clone https://github.com/Fannovel16/ComfyUI-Frame-Interpolation \
+      && cd ComfyUI-Frame-Interpolation \
+      && pip install -r requirements-no-cupy.txt \
+      && sed -i 's|ckpts_path:.*|ckpts_path: "/ComfyUI/models/frame_interpolation"|' config.yaml \
+      && mkdir -p /ComfyUI/models/frame_interpolation/rife \
+      && python -c "import urllib.request; urllib.request.urlretrieve('https://github.com/styler00dollar/VSGAN-tensorrt-docker/releases/download/models/rife47.pth','/ComfyUI/models/frame_interpolation/rife/rife47.pth')" \
+    ) || echo "WARN: Frame-Interpolation/RIFE falhou — toggle RIFE indisponivel."; \
+    set -e
+
     
 RUN cd /ComfyUI/custom_nodes && \
     git clone https://github.com/eddyhhlure1Eddy/IntelligentVRAMNode && \
