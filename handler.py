@@ -18,6 +18,19 @@ logger = logging.getLogger(__name__)
 
 server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
 client_id = str(uuid.uuid4())
+
+# Diretorio de input do ComfyUI — no Plano A o app manda o workflow pronto e as imagens
+# por NOME; a gente salva cada uma aqui pra os nos LoadImage acharem por filename.
+COMFYUI_INPUT_DIR = os.getenv("COMFYUI_INPUT_DIR", "/ComfyUI/input")
+
+
+def strip_data_uri(s):
+    """Remove o prefixo 'data:...;base64,' se vier do navegador."""
+    if isinstance(s, str) and s.startswith("data:") and "," in s:
+        return s.split(",", 1)[1]
+    return s
+
+
 def to_nearest_multiple_of_16(value):
     """주어진 값을 가장 가까운 16의 배수로 보정, 최소 16 보장"""
     try:
@@ -47,7 +60,7 @@ def process_input(input_data, temp_dir, output_filename, input_type):
     else:
         raise Exception(f"지원하지 않는 입력 타입: {input_type}")
 
-        
+
 def download_file_from_url(url, output_path):
     """URL에서 파일을 다운로드하는 함수"""
     try:
@@ -55,7 +68,7 @@ def download_file_from_url(url, output_path):
         result = subprocess.run([
             'wget', '-O', output_path, '--no-verbose', url
         ], capture_output=True, text=True)
-        
+
         if result.returncode == 0:
             logger.info(f"✅ URL에서 파일을 성공적으로 다운로드했습니다: {url} -> {output_path}")
             return output_path
@@ -74,22 +87,22 @@ def save_base64_to_file(base64_data, temp_dir, output_filename):
     """Base64 데이터를 파일로 저장하는 함수"""
     try:
         # Base64 문자열 디코딩
-        decoded_data = base64.b64decode(base64_data)
-        
+        decoded_data = base64.b64decode(strip_data_uri(base64_data))
+
         # 디렉토리가 존재하지 않으면 생성
         os.makedirs(temp_dir, exist_ok=True)
-        
+
         # 파일로 저장
         file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
         with open(file_path, 'wb') as f:
             f.write(decoded_data)
-        
+
         logger.info(f"✅ Base64 입력을 '{file_path}' 파일로 저장했습니다.")
         return file_path
     except (binascii.Error, ValueError) as e:
         logger.error(f"❌ Base64 디코딩 실패: {e}")
         raise Exception(f"Base64 디코딩 실패: {e}")
-    
+
 def queue_prompt(prompt):
     url = f"http://{server_address}:8188/prompt"
     logger.info(f"Queueing prompt to: {url}")
@@ -144,10 +157,80 @@ def load_workflow(workflow_path):
     with open(workflow_path, 'r') as file:
         return json.load(file)
 
+
+def run_prompt_and_return_video(prompt):
+    """Conecta no ComfyUI, roda o prompt (workflow ja montado) e devolve o 1o video em base64.
+    Fatorado pra ser reusado tanto pelo caminho legado quanto pelo Plano A (workflow externo)."""
+    ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
+    logger.info(f"Connecting to WebSocket: {ws_url}")
+
+    # 먼저 HTTP 연결이 가능한지 확인
+    http_url = f"http://{server_address}:8188/"
+    logger.info(f"Checking HTTP connection to: {http_url}")
+
+    # HTTP 연결 확인 (최대 1분)
+    max_http_attempts = 180
+    for http_attempt in range(max_http_attempts):
+        try:
+            response = urllib.request.urlopen(http_url, timeout=5)
+            logger.info(f"HTTP 연결 성공 (시도 {http_attempt+1})")
+            break
+        except Exception as e:
+            logger.warning(f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}")
+            if http_attempt == max_http_attempts - 1:
+                raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
+            time.sleep(1)
+
+    ws = websocket.WebSocket()
+    # 웹소켓 연결 시도 (최대 3분)
+    max_attempts = int(180/5)
+    for attempt in range(max_attempts):
+        try:
+            ws.connect(ws_url)
+            logger.info(f"웹소켓 연결 성공 (시도 {attempt+1})")
+            break
+        except Exception as e:
+            logger.warning(f"웹소켓 연결 실패 (시도 {attempt+1}/{max_attempts}): {e}")
+            if attempt == max_attempts - 1:
+                raise Exception("웹소켓 연결 시간 초과 (3분)")
+            time.sleep(5)
+    videos = get_videos(ws, prompt)
+    ws.close()
+
+    for node_id in videos:
+        if videos[node_id]:
+            return {"video": videos[node_id][0]}
+
+    return {"error": "비디오를 찾을 수 없습니다."}
+
+
 def handler(job):
     job_input = job.get("input", {})
 
-    logger.info(f"Received job input: {job_input}")
+    logger.info(f"Received job input keys: {list(job_input.keys())}")
+
+    # ============================================================================
+    # PLANO A — o app manda o workflow COMPLETO (controle total no cliente).
+    # Se vier 'workflow' no payload, roda ele direto: a unica coisa que o worker
+    # ainda faz e' materializar as imagens base64 em /ComfyUI/input/<name>, pra os
+    # nos LoadImage do workflow acharem por filename. Nada de injecao de parametros
+    # aqui — o app ja montou tudo (prompt, seed, steps, loras, RIFE, etc.).
+    # Formato: { "input": { "workflow": {...}, "images": [ {"name":"input.png","image":"<base64|dataURI>"} ] } }
+    # ============================================================================
+    custom_workflow = job_input.get("workflow")
+    if custom_workflow:
+        logger.info("Plano A: rodando workflow enviado pelo app.")
+        for img in job_input.get("images", []):
+            name = img.get("name")
+            data = img.get("image") or img.get("data")
+            if name and data:
+                save_base64_to_file(data, COMFYUI_INPUT_DIR, name)
+                logger.info(f"Imagem materializada em {COMFYUI_INPUT_DIR}/{name}")
+        return run_prompt_and_return_video(custom_workflow)
+
+    # ============================================================================
+    # CAMINHO LEGADO — JSON fixo + parametros flat (compatibilidade).
+    # ============================================================================
     task_id = f"task_{uuid.uuid4()}"
 
     # 이미지 입력 처리 (image_path, image_url, image_base64 중 하나만 사용)
@@ -171,22 +254,22 @@ def handler(job):
         end_image_path_local = process_input(job_input["end_image_url"], task_id, "end_image.jpg", "url")
     elif "end_image_base64" in job_input:
         end_image_path_local = process_input(job_input["end_image_base64"], task_id, "end_image.jpg", "base64")
-    
+
     # LoRA 설정 확인 - 배열로 받아서 처리
     lora_pairs = job_input.get("lora_pairs", [])
-    
+
     # 최대 4개 LoRA까지 지원
     lora_count = min(len(lora_pairs), 4)
     if lora_count > len(lora_pairs):
         logger.warning(f"LoRA 개수가 {len(lora_pairs)}개입니다. 최대 4개까지만 지원됩니다. 처음 4개만 사용합니다.")
         lora_pairs = lora_pairs[:4]
-    
+
     # 워크플로우 파일 선택 (end_image_*가 있으면 FLF2V 워크플로 사용)
     workflow_file = "/new_Wan22_flf2v_api.json" if end_image_path_local else "/new_Wan22_api.json"
     logger.info(f"Using {'FLF2V' if end_image_path_local else 'single'} workflow with {lora_count} LoRA pairs")
-    
+
     prompt = load_workflow(workflow_file)
-    
+
     length = job_input.get("length", 81)
     steps = job_input.get("steps", 10)
 
@@ -222,78 +305,26 @@ def handler(job):
     # 엔드 이미지가 있는 경우 617번 노드에 경로 적용 (FLF2V 전용)
     if end_image_path_local:
         prompt["617"]["inputs"]["image"] = end_image_path_local
-    
+
     # LoRA 설정 적용 - HIGH LoRA는 노드 279, LOW LoRA는 노드 553
     if lora_count > 0:
-        # HIGH LoRA 노드 (279번)
         high_lora_node_id = "279"
-        
-        # LOW LoRA 노드 (553번)
         low_lora_node_id = "553"
-        
-        # 입력받은 LoRA pairs 적용 (lora_1부터 시작)
         for i, lora_pair in enumerate(lora_pairs):
-            if i < 4:  # 최대 4개까지만
+            if i < 4:
                 lora_high = lora_pair.get("high")
                 lora_low = lora_pair.get("low")
                 lora_high_weight = lora_pair.get("high_weight", 1.0)
                 lora_low_weight = lora_pair.get("low_weight", 1.0)
-                
-                # HIGH LoRA 설정 (노드 279번, lora_1부터 시작)
                 if lora_high:
                     prompt[high_lora_node_id]["inputs"][f"lora_{i+1}"] = lora_high
                     prompt[high_lora_node_id]["inputs"][f"strength_{i+1}"] = lora_high_weight
                     logger.info(f"LoRA {i+1} HIGH applied to node 279: {lora_high} with weight {lora_high_weight}")
-                
-                # LOW LoRA 설정 (노드 553번, lora_1부터 시작)
                 if lora_low:
                     prompt[low_lora_node_id]["inputs"][f"lora_{i+1}"] = lora_low
                     prompt[low_lora_node_id]["inputs"][f"strength_{i+1}"] = lora_low_weight
                     logger.info(f"LoRA {i+1} LOW applied to node 553: {lora_low} with weight {lora_low_weight}")
 
-    ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
-    logger.info(f"Connecting to WebSocket: {ws_url}")
-    
-    # 먼저 HTTP 연결이 가능한지 확인
-    http_url = f"http://{server_address}:8188/"
-    logger.info(f"Checking HTTP connection to: {http_url}")
-    
-    # HTTP 연결 확인 (최대 1분)
-    max_http_attempts = 180
-    for http_attempt in range(max_http_attempts):
-        try:
-            import urllib.request
-            response = urllib.request.urlopen(http_url, timeout=5)
-            logger.info(f"HTTP 연결 성공 (시도 {http_attempt+1})")
-            break
-        except Exception as e:
-            logger.warning(f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}")
-            if http_attempt == max_http_attempts - 1:
-                raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
-            time.sleep(1)
-    
-    ws = websocket.WebSocket()
-    # 웹소켓 연결 시도 (최대 3분)
-    max_attempts = int(180/5)  # 3분 (1초에 한 번씩 시도)
-    for attempt in range(max_attempts):
-        import time
-        try:
-            ws.connect(ws_url)
-            logger.info(f"웹소켓 연결 성공 (시도 {attempt+1})")
-            break
-        except Exception as e:
-            logger.warning(f"웹소켓 연결 실패 (시도 {attempt+1}/{max_attempts}): {e}")
-            if attempt == max_attempts - 1:
-                raise Exception("웹소켓 연결 시간 초과 (3분)")
-            time.sleep(5)
-    videos = get_videos(ws, prompt)
-    ws.close()
-
-    # 이미지가 없는 경우 처리
-    for node_id in videos:
-        if videos[node_id]:
-            return {"video": videos[node_id][0]}
-    
-    return {"error": "비디오를를 찾을 수 없습니다."}
+    return run_prompt_and_return_video(prompt)
 
 runpod.serverless.start({"handler": handler})
