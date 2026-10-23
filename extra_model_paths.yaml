@@ -1,11 +1,27 @@
-# Aponta o ComfyUI pros modelos que vivem no NETWORK VOLUME (nao mais bakeados).
-# No serverless o volume monta em /runpod-volume. O ComfyUI busca AQUI + na pasta
-# padrao /ComfyUI/models (que fica vazia). Estrutura esperada no volume:
-#   /runpod-volume/wan_models/diffusion_models/  -> High + Low (+ Dasiwa no futuro)
-#   /runpod-volume/wan_models/text_encoders/     -> umt5-xxl-enc-bf16
-#   /runpod-volume/wan_models/clip_vision/       -> clip_vision_h
-#   /runpod-volume/wan_models/vae/               -> Wan2_1_VAE_bf16
-#   /runpod-volume/wan_models/loras/             -> LoRAs Lightning + suas LoRAs
+# Duas fontes de modelo, nesta ordem. A ORDEM IMPORTA: o ComfyUI usa a primeira
+# ocorrencia que achar, entao a copia local sempre vence a do volume.
+#
+# 1) /models_local/  -> DISCO LOCAL do worker. Preenchido no arranque pelo
+#    warm_local_models.sh, que copia do volume. Leitura rapida, sem latencia de rede.
+#
+# 2) /runpod-volume/wan_models/ -> NETWORK VOLUME (MooseFS). Duas funcoes:
+#    a) REDE DE SEGURANCA: se a copia do item 1 falhar (disco cheio, por exemplo),
+#       o ComfyUI acha o modelo aqui e o worker funciona — so' mais lento. Sem isso
+#       uma copia falha derrubaria a geracao inteira.
+#    b) FONTE UNICA das 17 LoRAs de teste (lora_high_1..17 / lora_low_1..17), que
+#       nao sao copiadas pro local: trocam com frequencia e somam ~12GB.
+#
+# Os dois blocos listam as mesmas categorias de proposito — e' o que faz o fallback
+# funcionar arquivo a arquivo, e nao tudo-ou-nada.
+
+local_fast:
+    base_path: /models_local/
+    diffusion_models: diffusion_models
+    text_encoders: text_encoders
+    clip_vision: clip_vision
+    vae: vae
+    loras: loras
+
 wan_volume:
     base_path: /runpod-volume/wan_models/
     diffusion_models: diffusion_models

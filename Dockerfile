@@ -1,6 +1,9 @@
-# Dockerfile LEVE do fork — modelos NAO sao mais bakeados (vao pro network volume).
+# Dockerfile LEVE do fork — modelos NAO sao bakeados (vao pro network volume).
 # Assim a imagem fica pequena e o GitHub Actions consegue buildar (runner tem ~50GB).
-# Os ~40GB de modelo sao baixados 1x pro volume via download_models_to_volume.sh.
+#
+# A lentidao de leitura do volume e' tratada em RUNTIME, nao no build: o
+# warm_local_models.sh copia os modelos de uso constante pro disco local do worker
+# no arranque. Ver o cabecalho daquele script pros numeros medidos.
 FROM wlsdml1114/engui_genai-base_blackwell:1.1 as runtime
 
 RUN pip install -U "huggingface_hub[hf_transfer]"
@@ -65,6 +68,16 @@ RUN set +e; cd /ComfyUI/custom_nodes; \
 
 COPY . .
 COPY extra_model_paths.yaml /ComfyUI/extra_model_paths.yaml
-RUN chmod +x /entrypoint.sh
 
-CMD ["/entrypoint.sh"]
+# O warm_local_models.sh e' um WRAPPER: copia os modelos pro disco local e so' depois
+# faz exec no /entrypoint.sh deste repo (que sobe o ComfyUI e depois o handler).
+# O entrypoint original segue INTACTO — o wrapper so' entra na frente dele.
+#
+# O `sed` tira CR de linha: estes arquivos sao editados no Windows, e um unico \r no
+# shebang faz o kernel procurar um interpretador chamado "bash\r" e o container morre
+# no arranque com "bad interpreter". O .gitattributes ja' forca LF, mas isso aqui
+# protege contra checkout feito com outra config. Barato de prevenir, chato de achar.
+RUN sed -i 's/\r$//' /warm_local_models.sh \
+    && chmod +x /entrypoint.sh /warm_local_models.sh
+
+CMD ["/warm_local_models.sh"]

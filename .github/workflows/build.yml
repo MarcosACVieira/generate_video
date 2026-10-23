@@ -1,8 +1,12 @@
 name: Build and push worker image
 
 # Builda a imagem LEVE do fork (sem os 40GB de modelo) no GitHub e publica no
-# GitHub Container Registry (ghcr.io). Depois e' so apontar o endpoint do RunPod
+# GitHub Container Registry (ghcr.io). Depois e' so' apontar o endpoint do RunPod
 # em "Deploy from a Docker image" pra essa imagem, com o network volume anexado.
+#
+# Os modelos seguem fora da imagem de proposito: quem resolve a lentidao de leitura
+# e' o warm_local_models.sh, copiando pro disco local em RUNTIME. Assar na imagem
+# daria o mesmo resultado e quebraria este workflow (passaria de 60GB).
 on:
   push:
     branches: [main]

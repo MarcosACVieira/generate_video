@@ -1,0 +1,6 @@
+# Scripts de shell SEMPRE com LF, independente de quem fez checkout em Windows.
+# Um unico \r no shebang faz o kernel do container procurar um interpretador chamado
+# "bash\r" e o worker morre no arranque com "bad interpreter" — erro silencioso e
+# chato de diagnosticar. O Dockerfile ainda roda um `sed` como segunda defesa.
+*.sh text eol=lf
+entrypoint.sh text eol=lf
